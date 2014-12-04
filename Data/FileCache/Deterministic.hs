@@ -6,9 +6,17 @@ A library for caching artifacts on disk.  This library assumes a
 deterministic key->value mapping, so it is an error if any program or
 multiple programs ever write different values to the same key.
 
+This module is intented to be imported qualified.
+
 -}
 
 module Data.FileCache.Deterministic
+       ( -- * Types
+         ProjName, ProjVersion, FileCacheConfig(..), FileCache,
+
+         -- * Operations
+         new, lookup, store, storeFile
+       )
        where
 
 import Control.Concurrent.MVar
@@ -19,6 +27,7 @@ import Data.Maybe
 import Data.Serialize
 import Data.Version
 import Data.Word
+import Prelude hiding (lookup)
 import System.Directory
 import System.FilePath
 import System.IO
@@ -28,13 +37,14 @@ import qualified Data.HashTable.IO                              as HT
 import qualified Data.ByteString.Char8                          as B
 
 
--- What method of mapping keys -> files on disk are we using? Whenever the
+-- | What method of mapping keys -> files on disk are we using? Whenever the
 -- behaviour of 'filenameOfKey' changes, the storage revision needs to be
 -- updated.
 --
 revision :: FilePath
 revision = "r1"
 
+-- RRN: Seems like this isn't guaranteed to be unique?
 filenameOfKey :: Hashable key => key -> FilePath
 filenameOfKey = show . hash
 
@@ -53,9 +63,14 @@ type ProjVersion = Version
 type HashTable key val = HT.BasicHashTable key val
 
 data FileCacheConfig = FileCacheConfig {
-    confName            :: Maybe ProjName       -- ^ The name under which our keys should be grouped.
+    confName            :: Maybe ProjName
+    -- ^ The name under which our keys should be grouped.  Any size
+    -- limits for the on-disk cache are per-project.
 
   , confVersion         :: Maybe ProjVersion
+    -- ^ The value associated with a given key may change when the
+    -- project version changes, but not otherwise.
+    
       -- TLM: well, this is more like what version of the keys I can handle, not
       --      necessarily related to the version of my project. For example, we
       --      might increment this only when the key-generation mechanism in
@@ -70,10 +85,18 @@ data FileCacheConfig = FileCacheConfig {
       -- ^ A location on disk for the file store. If this is `Nothing`, then a
       --   default, per-user location is used.
 
+  , confMaxMemBytes :: Maybe Word
+    -- ^ Maximum number of bytes of memory to use for caching on-disk values.
+    
     -- TODO: gc policy? Should the limits be stored as part of the cache, and
     --       asserted on every insert?
-  , confMaxEntries      :: Maybe Word
+
+    -- TODO: add Entries maxes as well as bytes:
+--  , confMaxDiskEntries      :: Maybe Word
+    -- Maximum number of entries stored on disk.
+    
   , confMaxSizeBytes    :: Maybe Word64
+    -- ^ Maxmium number of bytes on disk to use for this project.
   }
 
 instance Default FileCacheConfig where
