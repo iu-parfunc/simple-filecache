@@ -50,6 +50,14 @@ filenameOfKey :: (Show key, Binary key, Hashable key) => key -> FilePath
 -- filenameOfKey = show . hash
 filenameOfKey = SB.unpack . Hex.encode . B.toStrict . Bin.encode
 
+-- | Return a path underneath the one given.  The returned path is the
+-- unique file corresponding to the given key.
+-- 
+-- Note: This may introduce additional directories that need to be created.
+pathOfKey :: (Show key, Binary key, Hashable key) =>
+             FilePath -> key -> FilePath
+pathOfKey storeLocation key = storeLocation </> filenameOfKey key 
+
 
 {--
 -- A key must be serializable, but there are some good reasons NOT to
@@ -89,9 +97,7 @@ data FileCacheConfig = FileCacheConfig {
 
   , confMaxMemBytes :: Maybe Word
     -- ^ Maximum number of bytes of memory to use for caching on-disk values.
-    
-    -- TODO: gc policy? Should the limits be stored as part of the cache, and
-    --       asserted on every insert?
+    -- This maximum applies is for this FileCache object only.
 
     -- TODO: add Entries maxes as well as bytes:
 --  , confMaxDiskEntries      :: Maybe Word
@@ -99,6 +105,7 @@ data FileCacheConfig = FileCacheConfig {
     
   , confMaxSizeBytes    :: Maybe Word64
     -- ^ Maxmium number of bytes on disk to use for this project.
+    -- This maximum applies only to this "project" (but to all versions of it).
   }
  deriving (Show, Read, Eq, Ord)
 
@@ -189,6 +196,25 @@ new storeConfig@FileCacheConfig{..} = do
 -- loading from disk.  
 lookup :: (Eq key, Ord key, Hashable key, Binary key, Show key, Binary val) =>
           key -> FileCache key val -> IO (Maybe val)
+lookup key fc =
+  do res <- lookupFull key fc
+     case res of
+       (Nothing, Nothing) -> return Nothing
+       (Just memhit,_)    -> return (Just memhit)
+       (Nothing, Just diskhit) -> do
+         -- FIXME: catch all IO errors here!
+           dat <- B.readFile diskhit
+         -- TODO: Switch to an mmap-based file reading approach.
+           let val = either error Just (decode dat)
+           withMVar (storeCache fc) $ \sc -> HT.insert sc key val
+           return val
+
+
+-- | A version of `lookup` that returns whether there was a hit in the
+-- memory or disk levels of cache.  This version does not read any
+-- values from disk to memory.
+lookupFull :: (Eq key, Ord key, Hashable key, Binary key, Show key, Binary val) =>
+              key -> FileCache key val -> IO (Maybe val, Maybe FilePath)
 -- What should we return here? The FilePath (exposing details of where
 -- things are stored on disk) or load the file into memory and return
 -- a (strict) ByteString?
@@ -196,30 +222,29 @@ lookup :: (Eq key, Ord key, Hashable key, Binary key, Show key, Binary val) =>
 -- In the latter case, do we need a third policy of what is the maximum
 -- in-memory size that we cache?
 --
-lookup key FileCache{..} = do
-  -- Check the local cache
+lookupFull key FileCache{..} = do
+  -- Check the local cache:
   mval <- withMVar storeCache $ \sc -> HT.lookup sc key
+  let fp = pathOfKey storeLocation key 
   case mval of
     -- Local cache hit _and_ already loaded into memory
-    Just (Just v) -> return (Just v)
+    Just (Just v) -> return (Just v, Just fp)
 
     -- Check whether the file was stored to disk by a concurrent client. This is
     -- also the fall-through for cache-hit but not loaded, because we need to
     -- read the file and update the local cache in either case.
     _             -> do
-      let fp = storeLocation </> filenameOfKey key
       yes <- doesFileExist fp
-      if not yes
-         then return Nothing
-         else do
-           dat <- B.readFile fp
-           let val = either error Just (decode dat)
-           withMVar storeCache $ \sc -> HT.insert sc key val
-           return val
+      if yes
+         then return (Nothing, Just fp)
+         else return (Nothing, Nothing)
 
 
--- | Store a key-value pair onto disk in the given FileCache.
---
+
+-- | Store a key-value pair onto disk in the given FileCache.  This
+-- function is synchronous and returns only after the disk operation
+-- is complete.
+--        
 -- If there is already an entry for the key on disk, then `store`
 -- *compares* the old and new values.  If they differ, an error is
 -- thrown.  Thus, the on-disk entry behaves like an "IVar".  This
@@ -233,27 +258,36 @@ lookup key FileCache{..} = do
 store :: (Eq key, Ord key, Hashable key, Binary key, Show key, Binary val) =>
          key -> val -> FileCache key val -> IO ()
 -- TODO: Even if we don't need locking, we may need extra metadata
--- files on disk to record timestamps or sum up 
+-- files on disk to record timestamps or sum up disk usage
+-- efficiently: for example, by keeping a bytes sum at every directory
+-- level and updating all log(N) files when we write a key.
 store k v fc@FileCache{..} = do
   tmp <- bracket
            (openBinaryTempFile storeLocation (filenameOfKey k))
            (\(_,  h) -> hClose h)
            (\(fp, h) -> do B.hPut h (encode v)
                            return fp)
+-- FIXME: update the hash table!
   storeFile k tmp fc
 
 
 -- | Copy an already on-disk file to the file store.
--- 
+--
+-- The location to which files are added 
 -- Adding new files asserts the versioning policy.
 storeFile :: (Eq key, Ord key, Hashable key, Binary key, Show key) =>
              key -> FilePath -> FileCache key val -> IO ()
 storeFile k src FileCache{..} = do
-  let dst = storeLocation </> filenameOfKey k
-  renameFile src dst
-    `catchIOError` \_ -> do
-      copyFile src dst  -- copy to temporary location in destination directory and then move?
-      removeFile src
+  let dst = pathOfKey storeLocation k
+  -- TODO: test if it is already a path under storeLocation and avoid this extra copy:
+  (tmp,h) <- openBinaryTempFile storeLocation (filenameOfKey k)
+  hClose h
+  (do copyFile src dst
+      renameFile src dst)
+    `catchIOError` (\_ -> 
+      error "FINISHME: need a retry strategy here on failed IO")
+--      copyFile src dst  -- copy to temporary location in destination directory and then move..
+--      removeFile src
 
   -- TODO: Update the storeCache? See questions above.
 
