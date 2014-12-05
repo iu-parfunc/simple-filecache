@@ -24,7 +24,7 @@ import Control.Exception
 import Data.Default
 import Data.Hashable
 import Data.Maybe
-import Data.Serialize
+import Data.Binary
 import Data.Version
 import Data.Word
 import Prelude hiding (lookup)
@@ -34,8 +34,8 @@ import System.IO
 import System.IO.Error
 
 import qualified Data.HashTable.IO                              as HT
-import qualified Data.ByteString.Char8                          as B
-
+-- import qualified Data.ByteString.Char8                       as B
+import qualified Data.ByteString.Lazy.Char8                     as B
 
 -- | What method of mapping keys -> files on disk are we using? Whenever the
 -- behaviour of 'filenameOfKey' changes, the storage revision needs to be
@@ -177,7 +177,7 @@ new storeConfig@FileCacheConfig{..} = do
 
 -- | Lookup a key in the FileCache.  This may or may not require
 -- loading from disk.  
-lookup :: (Eq key, Ord key, Hashable key, Serialize val) =>
+lookup :: (Eq key, Ord key, Hashable key, Binary val) =>
           key -> FileCache key val -> IO (Maybe val)
 -- What should we return here? The FilePath (exposing details of where
 -- things are stored on disk) or load the file into memory and return
@@ -220,7 +220,7 @@ lookup key FileCache{..} = do
 -- Note, that if memory usage is capped for this project, inserting a
 -- new entry may cause older entries to be deleted with a
 -- least-recently-used (LRU) replacement policy.
-store :: (Eq key, Hashable key, Serialize val) =>
+store :: (Eq key, Hashable key, Binary val) =>
          key -> val -> FileCache key val -> IO ()
 -- TODO: Even if we don't need locking, we may need extra metadata
 -- files on disk to record timestamps or sum up 
