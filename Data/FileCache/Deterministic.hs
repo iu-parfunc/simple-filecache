@@ -16,7 +16,8 @@ module Data.FileCache.Deterministic
          ProjName, ProjVersion, FileCacheConfig(..), FileCache,
 
          -- * Operations
-         new, lookup, store, storeFile
+         new, lookup, store,
+         unsafeStoreFile
        )
        where
 
@@ -27,19 +28,15 @@ import Data.Hashable
 import Data.Maybe
 import Data.Binary as Bin
 import Data.Version
-import Data.Word
 import qualified Data.ByteString.Base16 as Hex
 import Prelude hiding (lookup)
 import System.Directory
 import System.FilePath
 import System.IO
 import System.IO.Error
-
 import qualified Data.HashTable.IO                              as HT
 import qualified Data.ByteString.Char8                          as SB
 import qualified Data.ByteString.Lazy.Char8                     as B
-
-import Debug.Trace
 
 
 -- | What method of mapping keys -> files on disk are we using? Whenever the
@@ -248,22 +245,29 @@ store k v fc@FileCache{..} = do
            (\(fp, h) -> do B.hPut h bytes
                            return fp)
 -- FIXME: update the hash table!
-  storeFile k tmp fc
+  unsafeStoreFile k tmp fc
 
 
 -- | Copy an already on-disk file to the file store.
 --
--- The location to which files are added 
--- Adding new files asserts the versioning policy.
-storeFile :: (Eq key, Ord key, Hashable key, Binary key, Show key) =>
+--   Note that this library stores Data.Binary SERIALIZED data on
+--   disk.  The ONLY files that are valid inputs to this function are
+--   those whose contents are produced by the `Data.Binary.encode`
+--   function.  Attempts to store any other files will result in
+--   decode errors upon lookup.
+--
+--   Adding new files respects storage caps.
+--  
+--   The location to which files are added is internal to library.
+unsafeStoreFile :: (Eq key, Ord key, Hashable key, Binary key, Show key) =>
              key -> FilePath -> FileCache key val -> IO ()
-storeFile k src FileCache{..} = do
+unsafeStoreFile k src FileCache{..} = do
   let dst = pathOfKey storeLocation k
   -- TODO: test if it is already a path under storeLocation and avoid this extra copy:
   (tmp,h) <- openBinaryTempFile storeLocation (filenameOfKey k)
   hClose h
-  (do copyFile src dst
-      renameFile src dst)
+  (do copyFile src tmp -- Make sure its on the same device.
+      renameFile tmp dst)
     `catchIOError` (\_ -> 
       error "FINISHME: need a retry strategy here on failed IO")
 --      copyFile src dst  -- copy to temporary location in destination directory and then move..
@@ -287,6 +291,16 @@ storeFile k src FileCache{..} = do
 -- unsafeStoreFile :: 
 
 
+test :: IO (Maybe String)
 test = do x <- new def :: IO (FileCache Int String);
           store 34 "hi" x;
           lookup 34 x
+
+test2 :: IO ()
+test2 = do let tmp = "/tmp/foobar"
+           B.writeFile tmp (encode ("Hello world"::String))
+           x <- new def 
+           unsafeStoreFile "key" tmp x
+           removeFile tmp           
+           Just res <- lookup "key" x
+           putStrLn res
