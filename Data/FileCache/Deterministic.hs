@@ -1,4 +1,4 @@
-{-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE RecordWildCards, NamedFieldPuns #-}
 
 {-|
 
@@ -24,9 +24,10 @@ import Control.Exception
 import Data.Default
 import Data.Hashable
 import Data.Maybe
-import Data.Binary
+import Data.Binary as Bin
 import Data.Version
 import Data.Word
+import qualified Data.ByteString.Base16 as Hex
 import Prelude hiding (lookup)
 import System.Directory
 import System.FilePath
@@ -34,7 +35,7 @@ import System.IO
 import System.IO.Error
 
 import qualified Data.HashTable.IO                              as HT
--- import qualified Data.ByteString.Char8                       as B
+import qualified Data.ByteString.Char8                          as SB
 import qualified Data.ByteString.Lazy.Char8                     as B
 
 -- | What method of mapping keys -> files on disk are we using? Whenever the
@@ -44,9 +45,10 @@ import qualified Data.ByteString.Lazy.Char8                     as B
 revision :: FilePath
 revision = "r1"
 
--- RRN: Seems like this isn't guaranteed to be unique?
-filenameOfKey :: Hashable key => key -> FilePath
-filenameOfKey = show . hash
+filenameOfKey :: (Show key, Binary key, Hashable key) => key -> FilePath
+-- RRN: Seems like this isn't guaranteed to be a collission-free hash?
+-- filenameOfKey = show . hash
+filenameOfKey = SB.unpack . Hex.encode . B.toStrict . Bin.encode
 
 
 {--
@@ -98,12 +100,14 @@ data FileCacheConfig = FileCacheConfig {
   , confMaxSizeBytes    :: Maybe Word64
     -- ^ Maxmium number of bytes on disk to use for this project.
   }
+ deriving (Show, Read, Eq, Ord)
 
 instance Default FileCacheConfig where
   def = FileCacheConfig Nothing Nothing Nothing Nothing Nothing
 
--- | The structure that stores the in-memory cached data that is read from disk.
+-- | The structure that stores in-memory cached data that is read from disk.
 --
+data FileCache key val = FileCache
 -- TLM: I'm a bit confused by this now. RE. Persistent.hs from acc-cuda, I
 --      thought we were in favour of getting rid of the index file, and then
 --      lookup corresponds to "does file exist on disk", which is safe to
@@ -115,9 +119,10 @@ instance Default FileCacheConfig where
 --      As I think about what fields should be in here, it looks very much like
 --      the FileCacheConfig object above.
 --
-data FileCache key val = FileCache
   {
     storeLocation       :: FilePath
+    -- ^ The path to a directory that contains all key/value pairs as
+    -- well as any meta-data files or locks for this `FileCache`.
   , storeConfig         :: FileCacheConfig
     -- ^ Keep the config we were created with, for future reference.
     
@@ -141,7 +146,7 @@ data FileCache key val = FileCache
     --     c. Have a separate thread that in the background periodically applies
     --        the versioning/limits policy based on the on-disk state.
     --
-    --     There may be no right choice for all use cases ):
+    --     There may be no right choice for all use cases :
     --
     --     On the other hand, what is the performance penalty for not having a
     --     local in-memory cache, and hitting disk every time? This also depends
@@ -158,6 +163,9 @@ data FileCache key val = FileCache
   , storeCache          :: MVar ( HashTable key (Maybe val) )
   }
 
+instance Show (FileCache key val) where
+  show (FileCache{storeLocation}) = "<filestore "++storeLocation++">"
+
 -------------------------------------------------------------------------------
 
 -- | Construct a 'FileCache' at the given location on disk, or at a
@@ -168,8 +176,10 @@ new storeConfig@FileCacheConfig{..} = do
   storeCache    <- newMVar =<< HT.new
   base          <- case confBasePath of
                      Just p     -> return p
-                     Nothing    -> getAppUserDataDirectory ("file-cache" </> revision)
-  let storeLocation = base </> fromMaybe "" confName </>  maybe "" showVersion confVersion
+                     Nothing    -> getAppUserDataDirectory ("file-cache")
+  let storeLocation = base </> revision </>
+                      fromMaybe "noproj" (fmap ("proj_"++) confName) </>
+                      maybe "no_version" showVersion confVersion
   createDirectoryIfMissing True storeLocation
   --
   return $ FileCache{..}
@@ -177,7 +187,7 @@ new storeConfig@FileCacheConfig{..} = do
 
 -- | Lookup a key in the FileCache.  This may or may not require
 -- loading from disk.  
-lookup :: (Eq key, Ord key, Hashable key, Binary val) =>
+lookup :: (Eq key, Ord key, Hashable key, Binary key, Show key, Binary val) =>
           key -> FileCache key val -> IO (Maybe val)
 -- What should we return here? The FilePath (exposing details of where
 -- things are stored on disk) or load the file into memory and return
@@ -220,7 +230,7 @@ lookup key FileCache{..} = do
 -- Note, that if memory usage is capped for this project, inserting a
 -- new entry may cause older entries to be deleted with a
 -- least-recently-used (LRU) replacement policy.
-store :: (Eq key, Hashable key, Binary val) =>
+store :: (Eq key, Ord key, Hashable key, Binary key, Show key, Binary val) =>
          key -> val -> FileCache key val -> IO ()
 -- TODO: Even if we don't need locking, we may need extra metadata
 -- files on disk to record timestamps or sum up 
@@ -236,7 +246,8 @@ store k v fc@FileCache{..} = do
 -- | Copy an already on-disk file to the file store.
 -- 
 -- Adding new files asserts the versioning policy.
-storeFile :: (Eq key, Hashable key) => key -> FilePath -> FileCache key val -> IO ()
+storeFile :: (Eq key, Ord key, Hashable key, Binary key, Show key) =>
+             key -> FilePath -> FileCache key val -> IO ()
 storeFile k src FileCache{..} = do
   let dst = storeLocation </> filenameOfKey k
   renameFile src dst
