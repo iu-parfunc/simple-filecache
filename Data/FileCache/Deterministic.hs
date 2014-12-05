@@ -69,7 +69,7 @@ data FileCacheConfig = FileCacheConfig {
 
   , confVersion         :: Maybe ProjVersion
     -- ^ The value associated with a given key may change when the
-    -- project version changes, but not otherwise.
+    -- `ProjVersion` changes, but not otherwise.
     
       -- TLM: well, this is more like what version of the keys I can handle, not
       --      necessarily related to the version of my project. For example, we
@@ -118,7 +118,9 @@ instance Default FileCacheConfig where
 data FileCache key val = FileCache
   {
     storeLocation       :: FilePath
-
+  , storeConfig         :: FileCacheConfig
+    -- ^ Keep the config we were created with, for future reference.
+    
     -- TLM: questions for 'storeCache'
     --
     --  1. Do we want to cache the entries that have been read from disk?
@@ -158,11 +160,11 @@ data FileCache key val = FileCache
 
 -------------------------------------------------------------------------------
 
-
--- | Construct a 'FileCache' at the given location on disk.
+-- | Construct a 'FileCache' at the given location on disk, or at a
+-- default location in the user's home directory, if unspecified.
 --
 new :: FileCacheConfig -> IO (FileCache key val)
-new FileCacheConfig{..} = do
+new storeConfig@FileCacheConfig{..} = do
   storeCache    <- newMVar =<< HT.new
   base          <- case confBasePath of
                      Just p     -> return p
@@ -173,14 +175,17 @@ new FileCacheConfig{..} = do
   return $ FileCache{..}
 
 
--- Lookup a key in the FileCache. What should we return here? The FilePath
--- (exposing details of where things are stored on disk) or load the file into
--- memory and return a (strict) ByteString?
+-- | Lookup a key in the FileCache.  This may or may not require
+-- loading from disk.  
+lookup :: (Eq key, Ord key, Hashable key, Serialize val) =>
+          key -> FileCache key val -> IO (Maybe val)
+-- What should we return here? The FilePath (exposing details of where
+-- things are stored on disk) or load the file into memory and return
+-- a (strict) ByteString?
 --
 -- In the latter case, do we need a third policy of what is the maximum
 -- in-memory size that we cache?
 --
-lookup :: (Eq key, Hashable key, Serialize val) => key -> FileCache key val -> IO (Maybe val)
 lookup key FileCache{..} = do
   -- Check the local cache
   mval <- withMVar storeCache $ \sc -> HT.lookup sc key
@@ -203,9 +208,22 @@ lookup key FileCache{..} = do
            return val
 
 
--- | Store a thing onto disk into the FileCache.
+-- | Store a key-value pair onto disk in the given FileCache.
 --
-store :: (Eq key, Hashable key, Serialize val) => key -> val -> FileCache key val -> IO ()
+-- If there is already an entry for the key on disk, then `store`
+-- *compares* the old and new values.  If they differ, an error is
+-- thrown.  Thus, the on-disk entry behaves like an "IVar".  This
+-- policy dynamically enforces the determinism contract.
+--
+-- UNFINISHED:
+--
+-- Note, that if memory usage is capped for this project, inserting a
+-- new entry may cause older entries to be deleted with a
+-- least-recently-used (LRU) replacement policy.
+store :: (Eq key, Hashable key, Serialize val) =>
+         key -> val -> FileCache key val -> IO ()
+-- TODO: Even if we don't need locking, we may need extra metadata
+-- files on disk to record timestamps or sum up 
 store k v fc@FileCache{..} = do
   tmp <- bracket
            (openBinaryTempFile storeLocation (filenameOfKey k))
@@ -215,11 +233,9 @@ store k v fc@FileCache{..} = do
   storeFile k tmp fc
 
 
--- | Add an already on-disk file to the file store. Adding new files asserts the
--- versioning policy.
---
--- TLM: Do we move or copy the file?
---
+-- | Copy an already on-disk file to the file store.
+-- 
+-- Adding new files asserts the versioning policy.
 storeFile :: (Eq key, Hashable key) => key -> FilePath -> FileCache key val -> IO ()
 storeFile k src FileCache{..} = do
   let dst = storeLocation </> filenameOfKey k

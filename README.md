@@ -9,8 +9,12 @@ Comparison against related packages
 ===================================
 
 
+ * filestore -- manages 
+
  * filecache -- 
- * filestore -- 
+
+ * cached-traversable -- cache parts of a single lazy Traversable,
+   element by element.
 
  * persistent-sqlite --
 
