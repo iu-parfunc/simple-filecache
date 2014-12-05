@@ -1,3 +1,4 @@
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE RecordWildCards, NamedFieldPuns #-}
 
 {-|
@@ -38,6 +39,9 @@ import qualified Data.HashTable.IO                              as HT
 import qualified Data.ByteString.Char8                          as SB
 import qualified Data.ByteString.Lazy.Char8                     as B
 
+import Debug.Trace
+
+
 -- | What method of mapping keys -> files on disk are we using? Whenever the
 -- behaviour of 'filenameOfKey' changes, the storage revision needs to be
 -- updated.
@@ -68,6 +72,7 @@ type Key = B.ByteString
 
 
 type ProjName    = String
+
 type ProjVersion = Version
 
 type HashTable key val = HT.BasicHashTable key val
@@ -79,7 +84,7 @@ data FileCacheConfig = FileCacheConfig {
 
   , confVersion         :: Maybe ProjVersion
     -- ^ The value associated with a given key may change when the
-    -- `ProjVersion` changes, but not otherwise.
+    -- `ProjVersion` changes, but not otherwise.    
     
       -- TLM: well, this is more like what version of the keys I can handle, not
       --      necessarily related to the version of my project. For example, we
@@ -98,14 +103,17 @@ data FileCacheConfig = FileCacheConfig {
   , confMaxMemBytes :: Maybe Word
     -- ^ Maximum number of bytes of memory to use for caching on-disk values.
     -- This maximum applies is for this FileCache object only.
+    --
+    -- If this limit is set to zero then no in-memory caching is
+    -- performed and we read from disk on each lookup.    
+    
+  , confMaxDiskBytes    :: Maybe Word64
+    -- ^ Maxmium number of bytes on disk to use for this project.
+    -- This maximum applies only to this "project" (but to all versions of it).
 
     -- TODO: add Entries maxes as well as bytes:
 --  , confMaxDiskEntries      :: Maybe Word
-    -- Maximum number of entries stored on disk.
-    
-  , confMaxSizeBytes    :: Maybe Word64
-    -- ^ Maxmium number of bytes on disk to use for this project.
-    -- This maximum applies only to this "project" (but to all versions of it).
+    -- Maximum number of entries stored on disk.    
   }
  deriving (Show, Read, Eq, Ord)
 
@@ -133,41 +141,13 @@ data FileCache key val = FileCache
   , storeConfig         :: FileCacheConfig
     -- ^ Keep the config we were created with, for future reference.
     
-    -- TLM: questions for 'storeCache'
-    --
-    --  1. Do we want to cache the entries that have been read from disk?
-    --
-    --  2. If so, how strict will we be in maintaining the store limits if there
-    --     are potentially several clients putting things into the cache
-    --     concurrently.
-    --
-    --     a. On insertion/store, do I completely update my local 'storeCache'
-    --        to be consistent with what is on disk, and then apply the policy?
-    --        This sounds like an expensive operation.
-    --
-    --     b. On insertion/store, do I not care about the global view and just
-    --        update my local cache, and apply the policy based on that? This
-    --        means that two clients could have local views each within the
-    --        policy limits but the union of which would exceed said limits.
-    --
-    --     c. Have a separate thread that in the background periodically applies
-    --        the versioning/limits policy based on the on-disk state.
-    --
-    --     There may be no right choice for all use cases :
-    --
-    --     On the other hand, what is the performance penalty for not having a
-    --     local in-memory cache, and hitting disk every time? This also depends
-    --     on the answer to the question of whether or not 'lookup' reads the
-    --     file from disk, or just returns the path to said file (but then, can
-    --     we guarantee that that path will remain valid?)
-    --
-    --  3. When we add a file to the store, should we add it to the
-    --     'storeCache'? This particularly applies to storing a file that might
-    --     not exist in memory at all. Additionally, maybe the user wants to
-    --     store files to disk so that they can be _purged_ from memory, and
-    --     this certainly would defeat that.
-    --
-  , storeCache          :: MVar ( HashTable key (Maybe val) )
+  , storeCache          :: MVar ( HashTable key val )
+    -- ^ The in-memory cache itself.
+
+    -- TODO: if we want to limit the size of this in-memory hash
+    -- table, we need to store something like (Word64, HashTable ...)
+    -- so we can keep track of how much is used.  Although there may
+    -- be more efficient structures for enacting LRU.   How about Data.Sequence?
   }
 
 instance Show (FileCache key val) where
@@ -194,7 +174,7 @@ new storeConfig@FileCacheConfig{..} = do
 
 -- | Lookup a key in the FileCache.  This may or may not require
 -- loading from disk.  
-lookup :: (Eq key, Ord key, Hashable key, Binary key, Show key, Binary val) =>
+lookup :: forall key val. (Eq key, Ord key, Hashable key, Binary key, Show key, Binary val) =>
           key -> FileCache key val -> IO (Maybe val)
 lookup key fc =
   do res <- lookupFull key fc
@@ -205,10 +185,9 @@ lookup key fc =
          -- FIXME: catch all IO errors here!
            dat <- B.readFile diskhit
          -- TODO: Switch to an mmap-based file reading approach.
-           let val = either error Just (decode dat)
+           let val::val = decode dat
            withMVar (storeCache fc) $ \sc -> HT.insert sc key val
-           return val
-
+           return (Just val)
 
 -- | A version of `lookup` that returns whether there was a hit in the
 -- memory or disk levels of cache.  This version does not read any
@@ -228,7 +207,7 @@ lookupFull key FileCache{..} = do
   let fp = pathOfKey storeLocation key 
   case mval of
     -- Local cache hit _and_ already loaded into memory
-    Just (Just v) -> return (Just v, Just fp)
+    Just v -> return (Just v, Just fp)
 
     -- Check whether the file was stored to disk by a concurrent client. This is
     -- also the fall-through for cache-hit but not loaded, because we need to
@@ -262,10 +241,11 @@ store :: (Eq key, Ord key, Hashable key, Binary key, Show key, Binary val) =>
 -- efficiently: for example, by keeping a bytes sum at every directory
 -- level and updating all log(N) files when we write a key.
 store k v fc@FileCache{..} = do
+  let bytes = encode v
   tmp <- bracket
            (openBinaryTempFile storeLocation (filenameOfKey k))
            (\(_,  h) -> hClose h)
-           (\(fp, h) -> do B.hPut h (encode v)
+           (\(fp, h) -> do B.hPut h bytes
                            return fp)
 -- FIXME: update the hash table!
   storeFile k tmp fc
@@ -291,8 +271,7 @@ storeFile k src FileCache{..} = do
 
   -- TODO: Update the storeCache? See questions above.
 
-  -- TODO: apply versioning policy
-
+  -- TODO: assert determinism policy by checking (new==old)
 
 
 
@@ -303,41 +282,11 @@ storeFile k src FileCache{..} = do
 -- Use this only if you are SURE that the only nondeterminism present
 -- is benign (e.g. date/time stamps being included in value).
 --
--- TLM: I'm not sure what this means?
---
--- unsafeLookup :: (Eq key, Serializable key) => (ProjName,ProjVersion) -> key -> IO (Maybe val)
--- unsafeLookup = undefined
+-- unsafeStore ::
 
--- unsafeLookup :: (Eq key, Serializable key) => key -> FileCache key val -> IO (Maybe val)
-
--- (require 'evil)
+-- unsafeStoreFile :: 
 
 
-
-
-{-
-_ = do
-   cabalD <- getAppUserDataDirectory "cabal"
-   let tokenD = cabalD </> "googleAuthTokens"
-       tokenF = tokenD </> clientId client <.> "token"
-   d1       <- doesDirectoryExist cabalD     
-   unless d1 $ createDirectory cabalD -- Race.
-   d2       <- doesDirectoryExist tokenD 
-   unless d2 $ createDirectory tokenD -- Race.
-   f1       <- doesFileExist tokenF
-   if f1 then do
-      str <- readFile tokenF
-      case reads str of
-        -- Here's our approach to versioning!  If we can't read it, we remove it.
-        ((oldtime,toks),_):_ -> do
-          tagged <- checkExpiry tokenF (oldtime,toks)
-          return (snd tagged)
-        [] -> do
-          putStrLn$" [getCachedTokens] Could not read tokens from file: "++ tokenF
-          putStrLn$" [getCachedTokens] Removing tokens and re-authenticating..."
-          removeFile tokenF 
-          getCachedTokens client
-    else do 
-     toks <- askUser
-     fmap snd$ timeStampAndWrite tokenF toks
---}
+test = do x <- new def :: IO (FileCache Int String);
+          store 34 "hi" x;
+          lookup 34 x
